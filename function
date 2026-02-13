@@ -1,208 +1,202 @@
+var SHEET_NAME = "PropertyAPI";
+var HEADERS = [
+  "Region",
+  "Title",
+  "StreetAddress",
+  "Suburb",
+  "Postcode",
+  "DisplayPrice",
+  "PriceRange",
+  "PropertyType",
+  "Bedrooms",
+  "Bathrooms",
+  "CarSpaces",
+  "Features",
+  "LandSize",
+  "Description",
+  "ListingID",
+  "AgencyListingID",
+  "AgencyName",
+  "AgencyEmail",
+  "Inspection1",
+  "Inspection2",
+  "Inspection3",
+  "ModifiedDate",
+  "Link"
+];
+
+var DEFAULT_QUERY = {
+  pageSize: 500,
+  maxPrice: 950000,
+  minBedrooms: 3
+};
+
+var REGIONS = [
+  "region:Brisbane - Greater Region, QLD",
+  "region:Brisbane - Southern Region, QLD",
+  "region:Brisbane - Western Region, QLD"
+];
+
+var EXCLUDED_PROPERTY_TYPES = {
+  "retirement living": true,
+  "residential land": true
+};
+
 function pullAllRegions() {
-
   var props = PropertiesService.getScriptProperties();
-
   var apiKey = props.getProperty("rapidAPI.key");
   var apiHost = props.getProperty("rapidAPI.host");
   var baseUrl = props.getProperty("baseUrl");
 
-  var pageSize = 500;
-  var maxPrice = 950000;
-  var minBedrooms = 3;
-  var regions = [
-    "region:Brisbane - Greater Region, QLD",
-    "region:Brisbane - Southern Region, QLD",
-    "region:Brisbane - Western Region, QLD"
-  ];
-
-  var spreadsheet = SpreadsheetApp.getActive();
-  var sheet = spreadsheet.getSheetByName("PropertyAPI");
-
-  if (!sheet) {
-    sheet = spreadsheet.insertSheet("PropertyAPI");
-  }
-
+  var sheet = ensureSheet_(SHEET_NAME);
   sheet.clear();
-
-  sheet.getRange(1,1,1,23).setValues([[
-    "Region",
-    "Title",
-    "StreetAddress",
-    "Suburb",
-    "Postcode",
-    "DisplayPrice",
-    "PriceRange",
-    "PropertyType",
-    "Bedrooms",
-    "Bathrooms",
-    "CarSpaces",
-    "Features",
-    "LandSize",
-    "Description",
-    "ListingID",
-    "AgencyListingID",
-    "AgencyName",
-    "AgencyEmail",
-    "Inspection1",
-    "Inspection2",
-    "Inspection3",
-    "ModifiedDate",
-    "Link"
-  ]]);
+  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
 
   var allResults = [];
 
-  for (var r = 0; r < regions.length; r++) {
+  REGIONS.forEach(function(region) {
+    var listings = fetchRegionListings_(region, baseUrl, apiKey, apiHost);
 
-    var params = [
-      "locationId=" + encodeURIComponent(regions[r]),
-      "pageSize=" + pageSize,
-      "maxPrice=" + maxPrice,
-      "minBedrooms=" + minBedrooms
-    ];
+    if (!listings.length) {
+      Logger.log("No data returned for " + region);
+      return;
+    }
 
-    var url = baseUrl + "?" + params.join("&");
+    var keptCount = 0;
 
-    var options = {
-      method: "GET",
-      headers: {
-        "X-RapidAPI-Key": apiKey,
-        "X-RapidAPI-Host": apiHost
+    listings.forEach(function(listing) {
+      if (isExcludedPropertyType_(listing.propertyType)) {
+        return;
       }
-    };
+
+      allResults.push(toSheetRow_(listing, region));
+      keptCount++;
+    });
+
+    Logger.log(region + " returned " + listings.length + " listings, kept " + keptCount);
+  });
+
+  if (allResults.length > 0) {
+    sheet.getRange(2, 1, allResults.length, HEADERS.length).setValues(allResults);
+  }
+
+  Logger.log("Loaded " + allResults.length + " properties.");
+}
+
+function ensureSheet_(sheetName) {
+  var spreadsheet = SpreadsheetApp.getActive();
+  var sheet = spreadsheet.getSheetByName(sheetName);
+  return sheet || spreadsheet.insertSheet(sheetName);
+}
+
+function fetchRegionListings_(region, baseUrl, apiKey, apiHost) {
+  var queryParams = Object.keys(DEFAULT_QUERY).map(function(key) {
+    return key + "=" + encodeURIComponent(DEFAULT_QUERY[key]);
+  });
+
+  queryParams.unshift("locationId=" + encodeURIComponent(region));
+
+  var url = baseUrl + "?" + queryParams.join("&");
+  var options = {
+    method: "GET",
+    headers: {
+      "X-RapidAPI-Key": apiKey,
+      "X-RapidAPI-Host": apiHost
+    }
+  };
 
   var response = UrlFetchApp.fetch(url, options);
   var status = response.getResponseCode();
 
   if (status !== 200) {
-    Logger.log("Error for region " + regions[r] + ": HTTP " + status);
-    continue;
+    Logger.log("Error for region " + region + ": HTTP " + status);
+    return [];
   }
 
   var json;
+
   try {
     json = JSON.parse(response.getContentText());
   } catch (e) {
-    Logger.log("JSON parse failed for region " + regions[r]);
-    continue;
+    Logger.log("JSON parse failed for region " + region);
+    return [];
   }
 
-    if (!json.data || !Array.isArray(json.data) || json.data.length === 0) {
-      Logger.log("No data returned for " + regions[r]);
-      continue;
-    }
-    var keptCount = 0;
+  return Array.isArray(json.data) ? json.data : [];
+}
 
-    for (var i = 0; i < json.data.length; i++) {
-      var p = json.data[i];
+function isExcludedPropertyType_(propertyType) {
+  var normalizedType = (propertyType || "").toLowerCase();
+  return !!EXCLUDED_PROPERTY_TYPES[normalizedType];
+}
 
-      // ---- Filter unwanted property types ----
-      var propertyType = (p.propertyType || "").toLowerCase();
+function toSheetRow_(listing, region) {
+  var address = listing.address || {};
+  var price = listing.price || {};
+  var advertising = listing.advertising || {};
+  var generalFeatures = (listing.features || {}).general || {};
+  var agency = listing.agency || {};
 
-      if (
-        propertyType === "retirement living" ||
-        propertyType === "residential land"
-      ) {
-        continue;
-      }
+  var featureList = flattenPropertyFeatures_(listing.propertyFeatures);
+  var inspections = getUpcomingInspections_(listing.inspectionsAndAuctions);
 
-      // ---- Core fields ----
-      var streetAddress = p.address?.streetAddress || "";
-      var suburb = p.address?.locality || "";
-      var postcode = p.address?.postcode || "";
+  return [
+    region,
+    listing.title || "",
+    address.streetAddress || "",
+    address.locality || "",
+    address.postcode || "",
+    price.display || "",
+    advertising.priceRange || "",
+    listing.propertyType || "",
+    generalFeatures.bedrooms || "",
+    generalFeatures.bathrooms || "",
+    generalFeatures.parkingSpaces || "",
+    featureList.join(", "),
+    (listing.landSize || {}).value || "",
+    listing.description || "",
+    listing.listingId || "",
+    listing.agencyListingId || "",
+    agency.name || "",
+    agency.email || "",
+    inspections[0],
+    inspections[1],
+    inspections[2],
+    listing.modifiedDate ? new Date(listing.modifiedDate) : "",
+    (((listing._links || {}).prettyUrl) || {}).href || ""
+  ];
+}
 
-      var displayPrice = p.price?.display || "";
-      var priceRange = p.advertising?.priceRange || "";
+function flattenPropertyFeatures_(propertyFeatures) {
+  if (!Array.isArray(propertyFeatures)) {
+    return [];
+  }
 
-      var bedrooms = p.features?.general?.bedrooms || "";
-      var bathrooms = p.features?.general?.bathrooms || "";
-      var carSpaces = p.features?.general?.parkingSpaces || "";
-
-      var landSize = p.landSize?.value || "";
-      var description = p.description || "";
-
-      var listingId = p.listingId || "";
-      var agencyListingId = p.agencyListingId || "";
-
-      var agencyName = p.agency?.name || "";
-      var agencyEmail = p.agency?.email || "";
-
-      var link = p._links?.prettyUrl?.href || "";
-
-      var modifiedDate = p.modifiedDate
-        ? new Date(p.modifiedDate)
-        : "";
-
-      // ---- Flatten propertyFeatures ----
-      var featureList = [];
-
-      if (Array.isArray(p.propertyFeatures)) {
-        p.propertyFeatures.forEach(function(group) {
-          if (Array.isArray(group.features)) {
-            featureList = featureList.concat(group.features);
-          }
-        });
-      }
-
-      var features = featureList.join(", ");
-
-      // ---- Inspections (max 3 upcoming, non-auction) ----
-      var inspections = (p.inspectionsAndAuctions || [])
-        .filter(function(i) {
-          return i.auction === false && i.startTime;
-        })
-        .sort(function(a, b) {
-          return new Date(a.startTime) - new Date(b.startTime);
-        })
-        .slice(0, 3)
-        .map(function(i) {
-          return new Date(i.startTime);
-        });
-
-      while (inspections.length < 3) {
-        inspections.push("");
-      }
-
-      // ---- Push row ----
-      allResults.push([
-        regions[r],
-        p.title || "",
-        streetAddress,
-        suburb,
-        postcode,
-        displayPrice,
-        priceRange,
-        p.propertyType || "",
-        bedrooms,
-        bathrooms,
-        carSpaces,
-        features,
-        landSize,
-        description,
-        listingId,
-        agencyListingId,
-        agencyName,
-        agencyEmail,
-        inspections[0],
-        inspections[1],
-        inspections[2],
-        modifiedDate,
-        link
-      ]);
-
-      keptCount++;
+  return propertyFeatures.reduce(function(accumulator, group) {
+    if (Array.isArray(group.features)) {
+      return accumulator.concat(group.features);
     }
 
-    Logger.log(
-  regions[r] +
-  " returned " + json.data.length +
-  " listings, kept " + keptCount
-);
+    return accumulator;
+  }, []);
+}
 
+function getUpcomingInspections_(inspectionsAndAuctions) {
+  var inspections = (inspectionsAndAuctions || [])
+    .filter(function(item) {
+      return item.auction === false && item.startTime;
+    })
+    .sort(function(a, b) {
+      return new Date(a.startTime) - new Date(b.startTime);
+    })
+    .slice(0, 3)
+    .map(function(item) {
+      return new Date(item.startTime);
+    });
+
+  while (inspections.length < 3) {
+    inspections.push("");
   }
 
-  if (allResults.length > 0) {
-    sheet.getRange(2,1,allResults.length,23).setValues(allResults);
-  }
-  Logger.log("Loaded " + allResults.length + " properties.");
+  return inspections;
 }
